@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, status
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from . import config, db, storage
@@ -512,8 +512,11 @@ def abort_session(session_id: str):
 # ---------------------------------------------------------------- archives
 
 
-@app.post("/archives", status_code=status.HTTP_201_CREATED)
-def create_archive(body: CreateArchiveRequest) -> dict:
+@app.post("/archives")
+def create_archive(
+    body: CreateArchiveRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> Response:
     """Export several completed uploads as one ZIP, in the requested order.
 
     Every id must reference a completed session whose product still exists on
@@ -522,9 +525,28 @@ def create_archive(body: CreateArchiveRequest) -> dict:
     ids are rejected at validation (422); an unknown session gives 404 and any
     non-completed / missing source gives 409, and in every error case no
     archive file or record is left behind.
+
+    Clients may send an `Idempotency-Key` header. The key is stored together
+    with the exact ordered request: retrying with the same key and list returns
+    the original archive (200, no second ZIP) even after the source sessions
+    were deleted; the same key with a different list/order is 409. Concurrent
+    same-key requests wait for the single builder and share its result; if the
+    build takes too long they get an explicit 409 in-progress response and may
+    retry. A failed/interrupted build never holds the key, and deleting the
+    archive retires the key so it can start a new request. Requests without
+    the header keep the original always-create behaviour (201).
     """
+    key = None
+    if idempotency_key is not None:
+        key = idempotency_key.strip()
+        if not key or len(key) > 255:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Idempotency-Key must be a non-empty value of at most 255 characters",
+            )
+
     try:
-        return storage.create_archive(body.session_ids)
+        payload, replay = storage.create_archive(body.session_ids, idempotency_key=key)
     except storage.ArchiveSourceError as exc:
         if exc.kind == "not_found":
             raise HTTPException(
@@ -546,6 +568,37 @@ def create_archive(body: CreateArchiveRequest) -> dict:
                 "session_id": exc.session_id,
             },
         )
+    except storage.IdempotencyConflict as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "message": (
+                    "Idempotency-Key was already used with a different request"
+                ),
+                "idempotency_key": key,
+                "stored_session_ids": exc.stored_session_ids,
+            },
+        )
+    except storage.ArchiveBuildInProgress:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "message": (
+                    "an archive build for this Idempotency-Key is already in "
+                    "progress; retry the same request to obtain its result"
+                ),
+                "idempotency_key": key,
+            },
+            headers={"Retry-After": "1"},
+        )
+
+    headers = {"Idempotency-Key": key} if key is not None else None
+    # First (keyless or newly built) response is 201; a replay is 200.
+    return JSONResponse(
+        payload,
+        status_code=status.HTTP_200_OK if replay else status.HTTP_201_CREATED,
+        headers=headers,
+    )
 
 
 @app.get("/archives/{archive_id}/content")

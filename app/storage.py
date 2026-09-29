@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -31,6 +32,19 @@ _merge_locks_guard = threading.Lock()
 def merge_lock(session_id: str) -> threading.Lock:
     with _merge_locks_guard:
         return _merge_locks.setdefault(session_id, threading.Lock())
+
+
+# One condition per idempotency key: same-key requests serialize through it so
+# exactly one becomes the builder; the others wait for the outcome (replay the
+# success, or race to take over a released claim after failure). The durable
+# claim itself lives in archive_idempotency_keys, which also heals crashes.
+_archive_key_conditions: dict[str, threading.Condition] = {}
+_archive_key_conditions_guard = threading.Lock()
+
+
+def _archive_build_condition(key: str) -> threading.Condition:
+    with _archive_key_conditions_guard:
+        return _archive_key_conditions.setdefault(key, threading.Condition())
 
 
 class SessionExpired(Exception):
@@ -136,6 +150,14 @@ def reconcile_archives() -> None:
             conn.execute("DELETE FROM archives WHERE id = ?", (archive_id,))
         for stale in on_disk - ids:
             (files_dir / f"{stale}.zip").unlink(missing_ok=True)
+
+        # Interrupted builds leave a 'building' idempotency claim and (at most)
+        # a temp artifact, never a published ZIP. Drop the claim so the key is
+        # usable again; a completed claim pointing at an archive removed above
+        # is cleaned by the FK cascade.
+        conn.execute(
+            "DELETE FROM archive_idempotency_keys WHERE status = 'building'"
+        )
 
     # Temporary artifacts from an interrupted build (none have a DB record).
     if files_dir.is_dir():
@@ -356,14 +378,98 @@ def archive_path(archive_id: str) -> Path:
     return config.archives_dir() / f"{archive_id}.zip"
 
 
-def create_archive(session_ids: list[str]) -> dict:
+class IdempotencyConflict(Exception):
+    """The same idempotency key was already used with a different request.
+
+    The stored, ordered session id list is carried for the 409 response so the
+    client can see the request the key is already bound to.
+    """
+
+    def __init__(self, stored_session_ids: list[str]):
+        super().__init__("idempotency key was already used with a different request")
+        self.stored_session_ids = stored_session_ids
+
+
+class ArchiveBuildInProgress(Exception):
+    """A same-key request is already building and did not finish in time."""
+
+
+def _request_fingerprint(session_ids: list[str]) -> tuple[str, str]:
+    """Return (hash, canonical-json) of the ordered session id list.
+
+    The list is serialized deterministically; two requests are "the same" only
+    if every id matches including its order.
+    """
+    canonical = json.dumps(session_ids, separators=(",", ":"), ensure_ascii=False)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return digest, canonical
+
+
+def _record_build(
+    archive_id: str,
+    published: Path,
+    members: list[dict],
+    idempotency_key: str | None,
+    request_hash: str | None,
+) -> None:
+    """Publish the archive rows, optionally settling its idempotency key.
+
+    The archive, its entries and the key's 'completed' transition commit in a
+    single transaction, so a settled key can never point at a missing archive.
+    A failure rolls the rows back (and, in the caller, removes the ZIP).
+    """
+    moment = db.utcnow()
+    with db.connect() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO archives (id, path, size, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (archive_id, str(published), published.stat().st_size, moment),
+            )
+            for position, member in enumerate(members):
+                conn.execute(
+                    "INSERT INTO archive_entries "
+                    "(archive_id, position, session_id, entry_name, file_size) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        archive_id,
+                        position,
+                        member["session_id"],
+                        member["entry_name"],
+                        member["file_size"],
+                    ),
+                )
+            if idempotency_key is not None:
+                cur = conn.execute(
+                    "UPDATE archive_idempotency_keys "
+                    "SET status = 'completed', archive_id = ?, completed_at = ? "
+                    "WHERE key = ? AND status = 'building' AND request_hash = ?",
+                    (archive_id, moment, idempotency_key, request_hash),
+                )
+                if cur.rowcount != 1:
+                    # Our claim vanished mid-build (e.g. manual DB tampering).
+                    # Refuse to publish a key-less record; the caller retries.
+                    raise RuntimeError("idempotency claim lost while building")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            published.unlink(missing_ok=True)
+            raise
+
+
+def _build_archive(session_ids: list[str], idempotency_key: str | None = None) -> dict:
     """Build a ZIP from completed sessions' products, in the given order.
 
     Every source file is opened and validated *first*; only then is the
     temporary archive written in bounded blocks, published atomically with
-    os.replace(), and finally recorded in the DB. Any failure before publish
-    removes the temp file, so a broken archive is never downloadable.
+    os.replace(), and finally recorded together with (optional) idempotency
+    state in a single transaction. Any failure before publish removes the temp
+    file, so a broken archive is never downloadable.
     """
+    request_hash = None
+    if idempotency_key is not None:
+        request_hash, _ = _request_fingerprint(session_ids)
+
     sources: list[sqlite3.Row] = []
     with db.connect() as conn:
         for sid in session_ids:
@@ -444,35 +550,111 @@ def create_archive(session_ids: list[str]) -> dict:
         for fh in handles:
             fh.close()
 
-    moment = db.utcnow()
-    with db.connect() as conn:
-        try:
-            conn.execute(
-                "INSERT INTO archives (id, path, size, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (archive_id, str(published), published.stat().st_size, moment),
-            )
-            for position, member in enumerate(members):
-                conn.execute(
-                    "INSERT INTO archive_entries "
-                    "(archive_id, position, session_id, entry_name, file_size) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (
-                        archive_id,
-                        position,
-                        member["session_id"],
-                        member["entry_name"],
-                        member["file_size"],
-                    ),
-                )
-            conn.commit()
-        except BaseException:
-            conn.rollback()
-            published.unlink(missing_ok=True)
-            raise
+    _record_build(archive_id, published, members, idempotency_key, request_hash)
 
     with db.connect() as conn:
         return archive_payload(conn, db.get_archive(conn, archive_id))
+
+
+def _discard_building_claim(key: str) -> None:
+    """Release a failed build's key so a retry may claim it.
+
+    Best effort: if this fails too, the next process restart's reconcile sweep
+    reaps all 'building' rows. Never raises into the original error path.
+    """
+    try:
+        with db.connect() as conn:
+            conn.execute(
+                "DELETE FROM archive_idempotency_keys WHERE key = ? AND status = 'building'",
+                (key,),
+            )
+    except Exception:
+        log.exception("failed to release idempotency claim for key %s", key)
+
+
+def _replay_payload(archive_id: str) -> dict:
+    with db.connect() as conn:
+        archive = db.get_archive(conn, archive_id)
+        if archive is None:
+            # Should not happen: the claim's FK + shared commit keep the pair
+            # together; answer honestly if they ever diverge.
+            raise KeyError(archive_id)
+        return archive_payload(conn, archive)
+
+
+def create_archive(
+    session_ids: list[str], idempotency_key: str | None = None
+) -> tuple[dict, bool]:
+    """Build a ZIP, optionally deduplicating concurrent/replayed requests.
+
+    Returns ``(payload, replay)`` where ``replay`` is True when the archive was
+    served from a previously completed idempotency record instead of freshly
+    built.
+
+    Without `idempotency_key` the behaviour is the historical one: every call
+    builds a fresh archive. With a key, the request content (ordered list) is
+    fingerprinted and the first same-key request becomes the single builder;
+    concurrent same-key requests wait for it and replay its archive, while the
+    same key bound to a different list/order is a conflict.
+    """
+    if idempotency_key is None:
+        return _build_archive(session_ids), False
+
+    key = idempotency_key
+    request_hash, request_json = _request_fingerprint(session_ids)
+    condition = _archive_build_condition(key)
+
+    # Phase 1: claim. Serialized by the per-key condition so exactly one
+    # requester can insert the 'building' row; everyone else waits here for
+    # the builder's outcome. The condition lock is never held while building.
+    while True:
+        with condition:
+            with db.connect() as conn:
+                claim = db.get_idempotency_key(conn, key)
+
+            if claim is not None and claim["request_hash"] != request_hash:
+                raise IdempotencyConflict(json.loads(claim["request_json"]))
+
+            if claim is not None and claim["status"] == "completed":
+                return _replay_payload(claim["archive_id"]), True
+
+            if claim is None:
+                # Persist the claim before building: another process/thread
+                # racing us will observe 'building' rather than double-build.
+                try:
+                    with db.connect() as conn:
+                        conn.execute(
+                            "INSERT INTO archive_idempotency_keys "
+                            "(key, request_hash, request_json, status, created_at) "
+                            "VALUES (?, ?, ?, 'building', ?)",
+                            (key, request_hash, request_json, db.utcnow()),
+                        )
+                except sqlite3.IntegrityError:
+                    # Lost an insert race against another process; re-evaluate.
+                    continue
+                is_builder = True
+                break
+
+            # A build is already in progress under this same key. Wait for the
+            # builder's signal (this releases the condition lock), then loop:
+            # success replays, failure lets us race to claim the retry, and a
+            # timeout tells the client explicitly that work is underway.
+            got_signal = condition.wait(config.ARCHIVE_BUILD_WAIT_SECONDS)
+        if not got_signal:
+            raise ArchiveBuildInProgress()
+
+    # Phase 2: build outside the condition lock. The durable DB claim (not the
+    # in-process lock) is what makes this request the sole builder.
+    try:
+        payload = _build_archive(session_ids, idempotency_key=key)
+    except BaseException:
+        _discard_building_claim(key)
+        with condition:
+            condition.notify_all()
+        raise
+    with condition:
+        condition.notify_all()
+    return payload, False
 
 
 def archive_payload(conn: sqlite3.Connection, archive: sqlite3.Row) -> dict:

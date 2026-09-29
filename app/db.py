@@ -58,6 +58,21 @@ CREATE TABLE IF NOT EXISTS archive_entries (
     file_size       INTEGER NOT NULL,
     PRIMARY KEY (archive_id, position)
 );
+
+-- Idempotency keys for POST /archives. A row starts life as 'building'
+-- (the claim that makes a concurrent same-key request wait) and becomes
+-- 'completed' in the same transaction that records the archive. The archive
+-- reference cascades on delete, so removing an archive retires the key.
+CREATE TABLE IF NOT EXISTS archive_idempotency_keys (
+    key           TEXT PRIMARY KEY,
+    request_hash  TEXT NOT NULL,   -- sha256 of the ordered session_ids list
+    request_json  TEXT NOT NULL,   -- the request content, verbatim (ordered JSON)
+    status        TEXT NOT NULL DEFAULT 'building'
+                  CHECK (status IN ('building', 'completed')),
+    archive_id    TEXT REFERENCES archives(id) ON DELETE CASCADE,
+    created_at    TEXT NOT NULL,
+    completed_at  TEXT
+);
 """
 
 # Columns added when the session-lease feature was introduced; databases
@@ -226,3 +241,11 @@ def get_archive_entries(conn: sqlite3.Connection, archive_id: str) -> list[sqlit
         "FROM archive_entries WHERE archive_id = ? ORDER BY position",
         (archive_id,),
     ).fetchall()
+
+
+def get_idempotency_key(
+    conn: sqlite3.Connection, key: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM archive_idempotency_keys WHERE key = ?", (key,)
+    ).fetchone()

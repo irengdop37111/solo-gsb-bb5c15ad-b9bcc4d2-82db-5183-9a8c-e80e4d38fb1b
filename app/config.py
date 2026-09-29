@@ -32,6 +32,12 @@ REAPER_INTERVAL_SECONDS = max(
     1.0, float(os.environ.get("REAPER_INTERVAL_SECONDS", "300"))
 )
 
+# How long a same-key request waits for a concurrent archive build before it is
+# answered with an explicit 409 "in progress" (it may simply retry afterwards).
+ARCHIVE_BUILD_WAIT_SECONDS = max(
+    1.0, float(os.environ.get("ARCHIVE_BUILD_WAIT_SECONDS", "30"))
+)
+
 DB_PATH = DATA_DIR / DB_FILENAME
 
 

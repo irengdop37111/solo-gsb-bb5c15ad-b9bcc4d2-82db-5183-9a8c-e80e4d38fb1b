@@ -7,6 +7,7 @@
 - 全部分片校验通过后才**原子合并**（临时文件 + `rename`）为目标文件
 - 完成的文件可直接 **GET 下载**：支持完整下载与单段 `Range`（断点续传），携带以整文件 SHA-256 生成的强 **ETag**
 - 已完成会话支持**批量 ZIP 导出**（`POST /archives`）：有序选择多个会话、重名自动去序号、原子发布、归档独立于原会话保存
+- 批量导出支持**幂等键**（`Idempotency-Key` 请求头）：同键 + 完全相同的有序列表重试返回同一归档（不重复构建），源会话删除后仍可重试；同键不同列表/顺序返回 `409`；并发同键请求只有一个构建者；构建失败、进程中断、删除归档都不会让键永久失效
 - 查询接口实时返回**缺失分片列表**与会话状态
 - **上传会话租约**：可指定 `idle_timeout_seconds`（默认 86400 秒 / 1 天，上限 604800 秒 / 7 天）；后台定时任务与启动恢复扫描自动回收超时会话（标记 `expired`、删除分片、记录 `expired_at`）
 - 元数据存 SQLite、分片存磁盘，**服务重启后可继续未完成会话**
@@ -40,6 +41,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `DATA_DIR`                  | `./data` | 存储根目录（SQLite、分片、成品文件）                         |
 | `PORT`                      | `8000`   | 监听端口（文档用途，以启动参数为准）                         |
 | `REAPER_INTERVAL_SECONDS`   | `300`    | 后台回收任务的扫描间隔（秒）；启动时总会先执行一次恢复扫描   |
+| `ARCHIVE_BUILD_WAIT_SECONDS`| `30`     | 同幂等键请求等待并发构建的最长时间（秒），超时返回 `409` 进行中响应 |
 
 存储布局（`DATA_DIR` 下）：
 
@@ -62,7 +64,7 @@ data/
 | GET    | `/uploads/{id}/content`               | 下载成品文件（支持 Range）                    |
 | GET    | `/uploads`                            | 列出可续传 / 已完成的会话（不含已过期）       |
 | DELETE | `/uploads/{id}`                       | 中止会话并清理                                |
-| POST   | `/archives`                           | 把多个已完成会话批量导出为一个 ZIP            |
+| POST   | `/archives`                           | 把多个已完成会话批量导出为一个 ZIP（可带 `Idempotency-Key`） |
 | GET    | `/archives/{id}/content`              | 下载归档 ZIP                                  |
 | DELETE | `/archives/{id}`                      | 删除归档 ZIP 及其记录                         |
 | GET    | `/healthz`                            | 健康检查                                      |
@@ -276,10 +278,48 @@ curl -X DELETE http://localhost:8000/archives/$AID
 
 归档是**独立快照**：创建成功后即使删除原上传会话（`DELETE /uploads/{id}` 会同时删除成品文件），既有归档的下载、记录与删除都不受影响。
 
+### 6b. 幂等创建（`Idempotency-Key`）
+
+`POST /archives` 可携带 `Idempotency-Key` 请求头（非空、长度 ≤ 255；空白值返回 `400`）。服务端把**键 + 请求内容（有序 `session_ids` 列表的指纹）+ 归档 ID** 持久化到数据库：
+
+- **首次成功**：正常构建，返回 `201`，响应头回显 `Idempotency-Key`
+- **同键、完全相同的列表（含顺序）重试**：不重复写入 ZIP，直接返回**同一归档**（`200`，响应体与首次一致，含原 `archive_id` / `created_at`）；即使首次请求之后源会话已被删除，重试仍可拿到同一归档
+- **同键但列表不同（成员或顺序不同）**：返回 `409 Conflict`，响应体 `detail.stored_session_ids` 给出该键已绑定的原列表
+- **并发同键请求**：只有**一个构建者**；其余请求在服务端等待结果——构建完成则返回同一成功结果（`200`），等待超过 `ARCHIVE_BUILD_WAIT_SECONDS`（默认 30 秒）则返回明确的 `409`（`detail.message` 说明构建进行中，带 `Retry-After: 1`），客户端用相同请求重试即可
+- **构建失败**：立即释放该键，随后用同键重试等同一次新请求（源不合法仍返回相应的 `404` / `409`）
+- **进程在构建中途中断**：`building` 占用记录与临时 ZIP 由**启动对账**清除，不会留下可下载的半成品，也不会永久占键
+- **删除归档后**：该键随之失效（随归档记录级联删除），之后再次使用按全新请求处理（`201`）
+- **不带 `Idempotency-Key`**：行为与旧版本完全一致——每次调用都创建新归档并返回 `201`
+
+```bash
+# 首次创建：服务端持久记录 键/请求内容/归档ID
+curl -X POST http://localhost:8000/archives \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-2026-09-29-0001' \
+  -d '{"session_ids": ["<sid-1>", "<sid-2>"]}'
+# 201 + archive_id=A
+
+# 网络超时？同键同列表原样重试 -> 同一归档，200，不重建 ZIP
+curl -X POST http://localhost:8000/archives \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-2026-09-29-0001' \
+  -d '{"session_ids": ["<sid-1>", "<sid-2>"]}'
+# 200 + archive_id=A
+
+# 同键换顺序 -> 409，detail.stored_session_ids 为原列表
+curl -X POST http://localhost:8000/archives \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-2026-09-29-0001' \
+  -d '{"session_ids": ["<sid-2>", "<sid-1>"]}'
+```
+
+典型客户端用法：在重试循环里固定一个业务侧生成的键（如 `订单号-导出序号` 或 UUID），遇到网络错误 / `409 进行中` 就用**完全相同的请求体**重试；收到 `200` 或 `201` 后用返回的 `archive_id` 下载即可，重复提交安全。
+
 ## 断点续传语义
 
 - 所有状态都在 `DATA_DIR` 内（SQLite + 分片文件），进程重启、容器重建（挂载同一 volume）后，未完成会话自动可用
 - 启动时自动对账：数据库记录与磁盘分片逐一核对，缺失或尺寸不符的记录会被剔除，客户端按 `missing_chunks` 重传即可
+- 归档对账同样在启动时执行：无记录的 ZIP、无 ZIP 的记录、构建临时文件，以及中断遗留的幂等键 `building` 占用都会被清除，键随后可重新使用
 - 启动对账后立即执行租约恢复扫描：停机期间超时的 `uploading` 会话被标记 `expired` 并清理分片
 - 分片写入同样先写临时文件再原子改名，不存在半写的分片
 - 旧版本数据库（无租约列）在启动时自动迁移：既有会话的空闲超时取默认值 86400 秒，`last_activity` 沿用其 `updated_at`，分片数据不受影响
@@ -291,12 +331,12 @@ pip install -r requirements-dev.txt
 pytest tests/
 ```
 
-测试覆盖：乱序上传、错误哈希拒绝与重试、重复分片幂等、未齐时合并返回 409、重启续传、整文件哈希校验、会话中止、完整/区间下载、ETag 与 304、If-Range 回退、416 越界处理，以及会话租约默认值/上限校验、创建后立即查询状态返回 200 并续租（回归）、分片上传与状态查询续租、后台回收（标记过期、删分片、上传/complete 返回 410 带 `expired_at`、过期会话可读但不续租也不入列表）、合并中会话不被回收、已完成与已删除会话不被误改、启动恢复扫描和旧库迁移；批量归档覆盖有序打包与条目内容、重名去序号并保留扩展名（含大小写冲突与无扩展名）、请求校验（空/重复 id 422）、源未完成/未知/成品丢失返回 409/404 且不留半成品、写入失败清理、删除归档（204/404、级联清理条目）、原会话删除后归档仍可下载、启动对账清理孤儿归档，以及大文件分块流式归档。
+测试覆盖：乱序上传、错误哈希拒绝与重试、重复分片幂等、未齐时合并返回 409、重启续传、整文件哈希校验、会话中止、完整/区间下载、ETag 与 304、If-Range 回退、416 越界处理，以及会话租约默认值/上限校验、创建后立即查询状态返回 200 并续租（回归）、分片上传与状态查询续租、后台回收（标记过期、删分片、上传/complete 返回 410 带 `expired_at`、过期会话可读但不续租也不入列表）、合并中会话不被回收、已完成与已删除会话不被误改、启动恢复扫描和旧库迁移；批量归档覆盖有序打包与条目内容、重名去序号并保留扩展名（含大小写冲突与无扩展名）、请求校验（空/重复 id 422）、源未完成/未知/成品丢失返回 409/404 且不留半成品、写入失败清理、删除归档（204/404、级联清理条目）、原会话删除后归档仍可下载、启动对账清理孤儿归档，以及大文件分块流式归档；幂等键覆盖同键重放返回同一归档（200、不重复写 ZIP）、源会话删除后仍可重放、同键不同列表/顺序 409 且回显原列表、构建失败后键立即可重试、中断遗留的 `building` 占用与临时文件在重启对账时清理、删除归档后键失效可重建、并发同键仅一个构建者其余返回同一结果、等待超时返回明确进行中响应、空白键 400，以及不带键请求保持每次新建（201）的原行为。
 
 ## 客户端示例（Python）
 
 ```python
-import hashlib, os, requests
+import hashlib, os, time, requests
 
 BASE = "http://localhost:8000"
 path, chunk_size = "video.mp4", 1024 * 1024
@@ -347,6 +387,26 @@ r = requests.post(
 r.raise_for_status()
 archive = r.json()
 print(archive["archive_id"], [(f["entry_name"], f["size"]) for f in archive["files"]])
+
+# 幂等创建：同键同列表重试安全（201=首次构建，200=返回既有归档）
+key = "order-2026-09-29-0001"
+for attempt in range(3):
+    r = requests.post(
+        f"{BASE}/archives",
+        json={"session_ids": [sid, another_sid]},  # 重试时请求体必须逐字一致
+        headers={"Idempotency-Key": key},
+    )
+    if r.status_code in (200, 201):
+        archive = r.json()
+        break
+    if r.status_code == 409 and "in progress" in r.json()["detail"]["message"]:
+        time.sleep(1)  # 同键构建仍在进行，稍后原样重试
+        continue
+    r.raise_for_status()
+else:
+    raise RuntimeError("archive creation did not settle")
+# 注意：409 + detail.stored_session_ids 表示同键已绑定另一个不同请求，
+# 属于客户端 bug，换键后不要原样重试。
 
 with requests.get(f"{BASE}/archives/{archive['archive_id']}/content", stream=True) as dl:
     dl.raise_for_status()
