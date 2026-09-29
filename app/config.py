@@ -32,6 +32,14 @@ REAPER_INTERVAL_SECONDS = max(
     1.0, float(os.environ.get("REAPER_INTERVAL_SECONDS", "300"))
 )
 
+# When a POST /archives carrying an Idempotency-Key finds another request with
+# the same key already building, it waits up to this many seconds for that
+# builder to finish (and then replays its result). Past the deadline it answers
+# 202 Accepted with Retry-After; the build itself is never aborted.
+IDEMPOTENCY_WAIT_TIMEOUT_SECONDS = max(
+    0.0, float(os.environ.get("IDEMPOTENCY_WAIT_TIMEOUT_SECONDS", "10"))
+)
+
 DB_PATH = DATA_DIR / DB_FILENAME
 
 

@@ -7,6 +7,7 @@
 - 全部分片校验通过后才**原子合并**（临时文件 + `rename`）为目标文件
 - 完成的文件可直接 **GET 下载**：支持完整下载与单段 `Range`（断点续传），携带以整文件 SHA-256 生成的强 **ETag**
 - 已完成会话支持**批量 ZIP 导出**（`POST /archives`）：有序选择多个会话、重名自动去序号、原子发布、归档独立于原会话保存
+- 批量导出支持**幂等键**（`Idempotency-Key` 请求头）：同键同列表只构建一次并永久返回同一归档；同键不同列表/顺序返回 `409`；并发同键只有一个构建者，其余复用结果或收到明确的“进行中”响应；构建失败/进程中断不会永久占用键，也不留可下载半成品；删除归档后键自动失效
 - 查询接口实时返回**缺失分片列表**与会话状态
 - **上传会话租约**：可指定 `idle_timeout_seconds`（默认 86400 秒 / 1 天，上限 604800 秒 / 7 天）；后台定时任务与启动恢复扫描自动回收超时会话（标记 `expired`、删除分片、记录 `expired_at`）
 - 元数据存 SQLite、分片存磁盘，**服务重启后可继续未完成会话**
@@ -35,17 +36,18 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ### 环境变量
 
-| 变量                        | 默认值   | 说明                                                         |
-| --------------------------- | -------- | ------------------------------------------------------------ |
-| `DATA_DIR`                  | `./data` | 存储根目录（SQLite、分片、成品文件）                         |
-| `PORT`                      | `8000`   | 监听端口（文档用途，以启动参数为准）                         |
-| `REAPER_INTERVAL_SECONDS`   | `300`    | 后台回收任务的扫描间隔（秒）；启动时总会先执行一次恢复扫描   |
+| 变量                                  | 默认值   | 说明                                                         |
+| ------------------------------------- | -------- | ------------------------------------------------------------ |
+| `DATA_DIR`                            | `./data` | 存储根目录（SQLite、分片、成品文件）                         |
+| `PORT`                                | `8000`   | 监听端口（文档用途，以启动参数为准）                         |
+| `REAPER_INTERVAL_SECONDS`             | `300`    | 后台回收任务的扫描间隔（秒）；启动时总会先执行一次恢复扫描   |
+| `IDEMPOTENCY_WAIT_TIMEOUT_SECONDS`    | `10`     | 同幂等键的并发请求等待在途构建的最长秒数，超时返回 `202`     |
 
 存储布局（`DATA_DIR` 下）：
 
 ```
 data/
-├── uploads.db          # SQLite：会话/分片/归档元数据（WAL 模式）
+├── uploads.db          # SQLite：会话/分片/归档/幂等键元数据（WAL 模式）
 ├── sessions/<id>/chunks/NNNNNNNN.part   # 已接收分片
 ├── files/<id>_<filename>                # 合并完成的文件
 └── archives/<archive_id>.zip            # 批量导出的 ZIP 归档
@@ -62,7 +64,7 @@ data/
 | GET    | `/uploads/{id}/content`               | 下载成品文件（支持 Range）                    |
 | GET    | `/uploads`                            | 列出可续传 / 已完成的会话（不含已过期）       |
 | DELETE | `/uploads/{id}`                       | 中止会话并清理                                |
-| POST   | `/archives`                           | 把多个已完成会话批量导出为一个 ZIP            |
+| POST   | `/archives`                           | 把多个已完成会话批量导出为一个 ZIP（可带 `Idempotency-Key`） |
 | GET    | `/archives/{id}/content`              | 下载归档 ZIP                                  |
 | DELETE | `/archives/{id}`                      | 删除归档 ZIP 及其记录                         |
 | GET    | `/healthz`                            | 健康检查                                      |
@@ -276,6 +278,56 @@ curl -X DELETE http://localhost:8000/archives/$AID
 
 归档是**独立快照**：创建成功后即使删除原上传会话（`DELETE /uploads/{id}` 会同时删除成品文件），既有归档的下载、记录与删除都不受影响。
 
+### 6b. 幂等归档（Idempotency-Key）
+
+`POST /archives` 可选携带 `Idempotency-Key` 请求头（1–255 个非空白字符；服务端对纯空白值返回 `400`，超过 255 字符返回 `400`）。携带键时，**键 + 请求内容（有序 session id 列表）**在首次成功时与归档 ID 一起持久化，之后的语义为：
+
+| 场景 | 响应 |
+| ---- | ---- |
+| 同键 + 完全相同的有序列表（首次） | `201`，正常构建 |
+| 同键 + 完全相同的列表（重试 / 重放） | `200`，返回**同一个归档**，不会重复写 ZIP；源会话随后被删除也照常返回 |
+| 同键 + 不同列表或不同顺序 | `409 Conflict`，键继续代表原请求 |
+| 同键并发请求 | 只有一个请求成为构建者（`201`）；其余请求在 `IDEMPOTENCY_WAIT_TIMEOUT_SECONDS`（默认 10 秒）内等待并复用其结果（`200`）；超时仍未完成则返回 `202 Accepted` + `Retry-After: 1`，稍后用**完全相同的请求**重试即可 |
+| 构建失败（源不合法、磁盘错误等） | 键被立即释放，下一次相同请求重新构建 |
+| 进程在构建中途中断 | 启动对账清除残留的 `building` 键和临时文件，键不被永久占用，也没有可下载的半成品 |
+| `DELETE /archives/{id}` 删除归档 | 键随归档级联失效；之后用该键的请求按**全新请求**处理 |
+
+不带 `Idempotency-Key` 的请求行为完全不变（每次都新建归档，返回 `201`）。
+
+```bash
+KEY="export-$(date +%s)-$RANDOM"
+
+# 首次：201
+curl -i -X POST http://localhost:8000/archives \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $KEY" \
+  -d '{"session_ids": ["<sid-1>", "<sid-2>"]}'
+
+# 网络超时后原样重试：200，archive_id 与首次完全一致，不会产生第二个 ZIP
+curl -i -X POST http://localhost:8000/archives \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $KEY" \
+  -d '{"session_ids": ["<sid-1>", "<sid-2>"]}'
+
+# 同一键换了顺序：409
+curl -i -X POST http://localhost:8000/archives \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $KEY" \
+  -d '{"session_ids": ["<sid-2>", "<sid-1>"]}'
+```
+
+正在构建时重试的进行中响应：
+
+```http
+HTTP/1.1 202 Accepted
+Retry-After: 1
+
+{"message": "an archive with this Idempotency-Key is being built; retry the identical request",
+ "idempotency_key": "export-…", "status": "in_progress"}
+```
+
+幂等记录（键、请求内容、状态、归档 ID）存于 SQLite 的 `archive_idempotency` 表，随 `DATA_DIR` 持久化，服务重启后继续生效。
+
 ## 断点续传语义
 
 - 所有状态都在 `DATA_DIR` 内（SQLite + 分片文件），进程重启、容器重建（挂载同一 volume）后，未完成会话自动可用
@@ -291,7 +343,7 @@ pip install -r requirements-dev.txt
 pytest tests/
 ```
 
-测试覆盖：乱序上传、错误哈希拒绝与重试、重复分片幂等、未齐时合并返回 409、重启续传、整文件哈希校验、会话中止、完整/区间下载、ETag 与 304、If-Range 回退、416 越界处理，以及会话租约默认值/上限校验、创建后立即查询状态返回 200 并续租（回归）、分片上传与状态查询续租、后台回收（标记过期、删分片、上传/complete 返回 410 带 `expired_at`、过期会话可读但不续租也不入列表）、合并中会话不被回收、已完成与已删除会话不被误改、启动恢复扫描和旧库迁移；批量归档覆盖有序打包与条目内容、重名去序号并保留扩展名（含大小写冲突与无扩展名）、请求校验（空/重复 id 422）、源未完成/未知/成品丢失返回 409/404 且不留半成品、写入失败清理、删除归档（204/404、级联清理条目）、原会话删除后归档仍可下载、启动对账清理孤儿归档，以及大文件分块流式归档。
+测试覆盖：乱序上传、错误哈希拒绝与重试、重复分片幂等、未齐时合并返回 409、重启续传、整文件哈希校验、会话中止、完整/区间下载、ETag 与 304、If-Range 回退、416 越界处理，以及会话租约默认值/上限校验、创建后立即查询状态返回 200 并续租（回归）、分片上传与状态查询续租、后台回收（标记过期、删分片、上传/complete 返回 410 带 `expired_at`、过期会话可读但不续租也不入列表）、合并中会话不被回收、已完成与已删除会话不被误改、启动恢复扫描和旧库迁移；批量归档覆盖有序打包与条目内容、重名去序号并保留扩展名（含大小写冲突与无扩展名）、请求校验（空/重复 id 422）、源未完成/未知/成品丢失返回 409/404 且不留半成品、写入失败清理、删除归档（204/404、级联清理条目）、原会话删除后归档仍可下载、启动对账清理孤儿归档，以及大文件分块流式归档。幂等归档覆盖：同键同列表重放同一归档且不重复写 ZIP（200/201 区分）、请求内容与归档 ID 持久化、源会话删除后仍可重放、同键不同列表/顺序返回 409、键格式非法返回 400、源不合法不占用键、六请求并发只有一个构建者其余重放、构建进行中超时返回 202 + Retry-After 后重试成功、进程中断残留的 building 键由启动对账释放、删除归档后键失效并可按新请求重新绑定，以及不带键请求保持原有无状态行为。
 
 ## 客户端示例（Python）
 
@@ -347,6 +399,28 @@ r = requests.post(
 r.raise_for_status()
 archive = r.json()
 print(archive["archive_id"], [(f["entry_name"], f["size"]) for f in archive["files"]])
+
+# 幂等归档：带稳定的业务键，重试安全（超时/断网后原样重发即可）。
+# 201=首次构建，200=复用已有归档，202=仍在构建（按 Retry-After 重试），409=同键不同列表
+import time, uuid
+
+def create_archive_idempotent(ids, key, max_wait=30):
+    deadline = time.monotonic() + max_wait
+    while True:
+        r = requests.post(
+            f"{BASE}/archives",
+            json={"session_ids": ids},
+            headers={"Idempotency-Key": key},
+        )
+        if r.status_code in (200, 201):
+            return r.json()
+        if r.status_code == 202:
+            assert time.monotonic() < deadline, "archive build took too long"
+            time.sleep(int(r.headers.get("Retry-After", "1")))
+            continue
+        r.raise_for_status()
+
+export = create_archive_idempotent([sid, another_sid], f"export-{uuid.uuid4()}")
 
 with requests.get(f"{BASE}/archives/{archive['archive_id']}/content", stream=True) as dl:
     dl.raise_for_status()

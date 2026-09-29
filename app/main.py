@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, status
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from . import config, db, storage
@@ -24,6 +24,9 @@ log = logging.getLogger("chunked-upload")
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 # One byte-range spec: "bytes=<start>-<end>", "<start>-" or "-<suffix>".
 SINGLE_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$", re.IGNORECASE)
+# Idempotency-Key: printable, non-blank, bounded length (same shape Stripe etc.
+# accept). Blank/whitespace keys are invalid rather than treated as absent.
+MAX_IDEMPOTENCY_KEY_LENGTH = 255
 # starlette renamed its 416 constant (the old alias now warns); pin our own
 # so the whole supported fastapi/starlette range stays warning-free.
 HTTP_416_RANGE_NOT_SATISFIABLE = 416
@@ -512,40 +515,105 @@ def abort_session(session_id: str):
 # ---------------------------------------------------------------- archives
 
 
-@app.post("/archives", status_code=status.HTTP_201_CREATED)
-def create_archive(body: CreateArchiveRequest) -> dict:
-    """Export several completed uploads as one ZIP, in the requested order.
-
-    Every id must reference a completed session whose product still exists on
-    disk; all source files are opened and pinned before the archive is written
-    (bounded buffering), atomically published and recorded. Duplicate or empty
-    ids are rejected at validation (422); an unknown session gives 404 and any
-    non-completed / missing source gives 409, and in every error case no
-    archive file or record is left behind.
-    """
-    try:
-        return storage.create_archive(body.session_ids)
-    except storage.ArchiveSourceError as exc:
-        if exc.kind == "not_found":
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND,
-                detail={"message": "session not found", "session_id": exc.session_id},
-            )
-        if exc.kind == "not_completed":
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                detail={
-                    "message": "session is not completed",
-                    "session_id": exc.session_id,
-                },
-            )
+def _raise_archive_source_error(exc: storage.ArchiveSourceError) -> None:
+    """Translate a bad archive source into the canonical 404/409 response."""
+    if exc.kind == "not_found":
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail={"message": "session not found", "session_id": exc.session_id},
+        )
+    if exc.kind == "not_completed":
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             detail={
-                "message": "completed file is missing on disk",
+                "message": "session is not completed",
                 "session_id": exc.session_id,
             },
         )
+    raise HTTPException(
+        status.HTTP_409_CONFLICT,
+        detail={
+            "message": "completed file is missing on disk",
+            "session_id": exc.session_id,
+        },
+    )
+
+
+@app.post("/archives", status_code=status.HTTP_201_CREATED)
+def create_archive(
+    body: CreateArchiveRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    """Export several completed uploads as one ZIP, in the requested order.
+
+    Without an ``Idempotency-Key`` header the behavior is unchanged: every call
+    builds and records a new archive.
+
+    With a key, the key plus the exact ordered session id list is persisted on
+    the first success together with the resulting archive id:
+
+    * same key + identical list -> the same archive is returned (200), no ZIP
+      is rewritten; it still replays after the source sessions are deleted;
+    * same key + different list or order -> 409, the key keeps representing
+      its original request until that archive is deleted;
+    * concurrent same-key requests -> exactly one builds; the others wait and
+      replay its result, or get 202 + ``Retry-After`` if the build is still
+      running after the wait deadline (retry the identical request);
+    * a failed/interrupted build releases the key, and no half-built ZIP is
+      ever downloadable;
+    * deleting the archive (DELETE /archives/{id}) invalidates the key, so the
+      next use starts a brand-new request.
+
+    Source validation is unchanged: unknown session -> 404, non-completed /
+    missing product -> 409, and every error case leaves no archive behind.
+    """
+    if idempotency_key is not None:
+        key = idempotency_key.strip()
+        if not key or len(key) > MAX_IDEMPOTENCY_KEY_LENGTH:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Idempotency-Key must be 1-{MAX_IDEMPOTENCY_KEY_LENGTH} non-blank characters",
+            )
+        try:
+            payload, replayed = storage.create_idempotent_archive(
+                body.session_ids, key
+            )
+        except storage.ArchiveSourceError as exc:
+            _raise_archive_source_error(exc)
+        except storage.IdempotencyConflict:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "message": (
+                        "Idempotency-Key was already used with a different "
+                        "session id list or order"
+                    ),
+                    "idempotency_key": key,
+                },
+            )
+        except storage.ArchiveInProgress:
+            return JSONResponse(
+                status_code=status.HTTP_202_ACCEPTED,
+                content={
+                    "message": (
+                        "an archive with this Idempotency-Key is being built; "
+                        "retry the identical request"
+                    ),
+                    "idempotency_key": key,
+                    "status": "in_progress",
+                },
+                headers={"Retry-After": "1"},
+            )
+        # Replayed successes answer 200; a fresh build answers 201.
+        return JSONResponse(
+            status_code=status.HTTP_200_OK if replayed else status.HTTP_201_CREATED,
+            content=payload,
+        )
+
+    try:
+        return storage.create_archive(body.session_ids)
+    except storage.ArchiveSourceError as exc:
+        _raise_archive_source_error(exc)
 
 
 @app.get("/archives/{archive_id}/content")

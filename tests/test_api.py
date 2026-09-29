@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import sqlite3
 import stat
 import tempfile
+import threading
+import time
 import zipfile
 from datetime import datetime, timedelta, timezone
 
@@ -627,6 +630,18 @@ def test_init_db_migrates_pre_lease_database():
             assert row["expired_at"] is None
             # Chunk rows and the FK survive the rebuild.
             assert db.received_indexes(migrated, "old1") == {0}
+            # The full current schema (archives + idempotency) is provisioned.
+            tables = {
+                row[0]
+                for row in migrated.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            assert {
+                "archives",
+                "archive_entries",
+                "archive_idempotency",
+            } <= tables
         # Migration is idempotent: a second init is a no-op.
         db.init_db()
     finally:
@@ -953,3 +968,359 @@ def test_archive_streams_large_files_with_bounded_buffer():
             assert zf.namelist() == ["big2.raw", "big1.raw"]
             assert zf.read("big1.raw") == big1
             assert zf.read("big2.raw") == big2
+
+
+# ------------------------------------------------- archive idempotency keys
+
+
+def _idem(
+    client: TestClient,
+    ids: list[str],
+    key: str,
+    expected: int | None = None,
+    **kwargs,
+):
+    resp = client.post(
+        "/archives",
+        json={"session_ids": ids},
+        headers={"Idempotency-Key": key},
+        **kwargs,
+    )
+    if expected is not None:
+        assert resp.status_code == expected, resp.text
+    return resp
+
+
+def test_idempotent_create_replays_same_archive_without_rewrite():
+    with TestClient(app) as client:
+        a = _completed_named(client, "a.txt", b"AAA")
+        b = _completed_named(client, "b.txt", b"BBBB")
+        ids = [a["session_id"], b["session_id"]]
+
+        first = _idem(client, ids, "key-replay", expected=201).json()
+        first_row = _archive_rows()
+
+        # Exact same key + exact same ordered list replays, never rebuilds.
+        second = _idem(client, ids, "key-replay", expected=200).json()
+        third = _idem(client, ids, " key-replay \t", expected=200).json()
+        assert second["archive_id"] == third["archive_id"] == first["archive_id"]
+        assert second == first
+        assert _archive_rows() == first_row  # no additional archive row
+
+        # The stored content is still downloadable and byte-identical.
+        resp = client.get(f"/archives/{first['archive_id']}/content")
+        assert resp.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            assert zf.read("a.txt") == b"AAA"
+            assert zf.read("b.txt") == b"BBBB"
+
+        # The key, the request content and the archive id were persisted.
+        with db.connect() as conn:
+            row = db.get_idempotency(conn, "key-replay")
+            assert row is not None
+            assert row["status"] == "completed"
+            assert row["archive_id"] == first["archive_id"]
+            assert json.loads(row["request_json"]) == ids
+
+
+def test_idempotent_replay_works_after_sources_deleted():
+    with TestClient(app) as client:
+        a = _completed_named(client, "a.txt", b"AAA")
+        b = _completed_named(client, "b.txt", b"BBBB")
+        ids = [a["session_id"], b["session_id"]]
+
+        created = _idem(client, ids, "key-sources-deleted", expected=201).json()
+        aid = created["archive_id"]
+
+        # Sources (and their product files) disappear; the replay must still
+        # hand out the same independent snapshot, without rebuilding.
+        assert client.delete(f"/uploads/{a['session_id']}").status_code == 204
+        assert client.delete(f"/uploads/{b['session_id']}").status_code == 204
+
+        replay = _idem(client, ids, "key-sources-deleted", expected=200)
+        assert replay.json()["archive_id"] == aid
+        assert client.get(f"/archives/{aid}/content").status_code == 200
+        with zipfile.ZipFile(
+            io.BytesIO(client.get(f"/archives/{aid}/content").content)
+        ) as zf:
+            assert zf.read("a.txt") == b"AAA"
+            assert zf.read("b.txt") == b"BBBB"
+
+
+def test_idempotent_key_same_key_different_list_or_order_conflicts():
+    with TestClient(app) as client:
+        a = _completed_named(client, "a.txt", b"AAA")
+        b = _completed_named(client, "b.txt", b"BBBB")
+        c = _completed_named(client, "c.txt", b"CCCCC")
+        ids = [a["session_id"], b["session_id"]]
+        key = "key-conflict"
+        created = _idem(client, ids, key, expected=201).json()
+
+        # Different membership -> 409, names the key, creates nothing.
+        rows_before = _archive_rows()
+        resp = _idem(client, [a["session_id"], c["session_id"]], key, expected=409)
+        assert resp.json()["detail"]["idempotency_key"] == key
+        # Same membership, different order -> 409 as well.
+        assert _idem(client, [b["session_id"], a["session_id"]], key).status_code == 409
+        # A subset / superset is a different request too.
+        assert _idem(client, [a["session_id"]], key).status_code == 409
+        assert _idem(client, ids + [c["session_id"]], key).status_code == 409
+        assert _archive_rows() == rows_before
+
+        # The original request is untouched and still replays.
+        assert _idem(client, ids, key, expected=200).json()["archive_id"] == (
+            created["archive_id"]
+        )
+
+
+def test_idempotent_failed_build_releases_key_and_leaves_nothing():
+    with TestClient(app) as client:
+        a = _completed_named(client, "a.txt", b"AAAA")
+        b = _completed_named(client, "b.txt", b"BBBB")
+        good_ids = [a["session_id"], b["session_id"]]
+        key = "key-fail-release"
+        before_files = set(os.listdir(config.archives_dir()))
+        before_rows = _archive_rows()
+
+        # A bad source fails validation; the key must not be reserved, so the
+        # same key can immediately serve a valid request.
+        resp = _idem(client, ["unknown-session"], key, expected=404)
+        assert resp.json()["detail"]["session_id"] == "unknown-session"
+        with db.connect() as conn:
+            assert db.get_idempotency(conn, key) is None
+
+        created = _idem(client, good_ids, key, expected=201).json()
+        assert client.get(f"/archives/{created['archive_id']}/content").status_code == 200
+        _no_archive_residue()
+        assert set(os.listdir(config.archives_dir())) >= before_files
+        assert before_rows < _archive_rows()
+
+
+def test_idempotent_concurrent_requests_have_single_builder():
+    with TestClient(app) as client:
+        a = _completed_named(client, "a.txt", b"AAAA")
+        b = _completed_named(client, "b.txt", b"BBBB")
+        ids = [a["session_id"], b["session_id"]]
+        key = "key-concurrent"
+        gate = threading.Event()
+        results: list[tuple[int, str]] = []
+        results_lock = threading.Lock()
+        original_build = storage._build_archive
+
+        def gated_build(session_ids, idempotency_key=None):
+            # The single builder holds the gate open until all peer requests
+            # have been dispatched and entered the waiter poll loop.
+            assert gate.wait(5)
+            return original_build(session_ids, idempotency_key=idempotency_key)
+
+        storage._build_archive = gated_build
+        try:
+            def worker() -> None:
+                resp = _idem(client, ids, key)
+                with results_lock:
+                    results.append((resp.status_code, resp.json()["archive_id"]))
+
+            threads = [threading.Thread(target=worker) for _ in range(6)]
+            for t in threads:
+                t.start()
+            # Wait until the builder claimed the key; give the other five
+            # threads time to dispatch and start polling the same row.
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with db.connect() as conn:
+                    row = db.get_idempotency(conn, key)
+                if row is not None and row["status"] == "building":
+                    break
+                time.sleep(0.01)
+            time.sleep(0.3)  # let the five losers settle into wait/poll
+            gate.set()
+            for t in threads:
+                t.join(15)
+                assert not t.is_alive()
+        finally:
+            storage._build_archive = original_build
+            gate.set()
+
+        # Exactly one 201 (the builder), the other five 200 replays.
+        statuses = sorted(code for code, _ in results)
+        assert statuses == [200, 200, 200, 200, 200, 201]
+        # Every request observed the very same archive.
+        archive_ids = {aid for _, aid in results}
+        assert len(archive_ids) == 1
+        # Exactly one idempotency row for the key.
+        with db.connect() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM archive_idempotency WHERE key = ?", (key,)
+            ).fetchone()[0]
+        assert count == 1
+
+
+def test_idempotent_in_progress_returns_202_then_replays(monkeypatch):
+    monkeypatch.setattr(config, "IDEMPOTENCY_WAIT_TIMEOUT_SECONDS", 0.2)
+    with TestClient(app) as client:
+        a = _completed_named(client, "a.txt", b"AAAA")
+        b = _completed_named(client, "b.txt", b"BBBB")
+        ids = [a["session_id"], b["session_id"]]
+        key = "key-pending-202"
+        entered = threading.Event()
+        release = threading.Event()
+        original_build = storage._build_archive
+
+        def hanging_build(session_ids, idempotency_key=None):
+            entered.set()
+            assert release.wait(5)
+            return original_build(session_ids, idempotency_key=idempotency_key)
+
+        storage._build_archive = hanging_build
+        try:
+            builder_outcome: dict = {}
+
+            def builder() -> None:
+                resp = _idem(client, ids, key)
+                builder_outcome["status"] = resp.status_code
+                builder_outcome["id"] = resp.json()["archive_id"]
+
+            thread = threading.Thread(target=builder)
+            thread.start()
+            assert entered.wait(5)
+
+            # While the build runs, a same-key request waits only until its
+            # short deadline, then answers 202 + Retry-After with no body data.
+            pending = _idem(client, ids, key)
+            assert pending.status_code == 202
+            assert pending.headers["retry-after"] == "1"
+            assert pending.json()["status"] == "in_progress"
+            assert pending.json()["idempotency_key"] == key
+        finally:
+            storage._build_archive = original_build
+            release.set()
+            thread.join(15)
+            assert not thread.is_alive()
+
+        assert builder_outcome["status"] == 201
+        # The retry after completion replays the builder's archive (200).
+        replay = _idem(client, ids, key, expected=200)
+        assert replay.json()["archive_id"] == builder_outcome["id"]
+
+
+def test_idempotent_interrupted_builder_releases_key_on_restart():
+    # Simulate a process killed mid-build: a 'building' row survives in the DB
+    # (there is neither a completed archive nor an in-process builder).
+    with TestClient(app) as client:
+        one = _completed_named(client, "one.txt", b"1111")
+        ids = [one["session_id"]]
+        key = "key-interrupted"
+        digest, content = storage.request_fingerprint(ids)
+        moment = db.utcnow()
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO archive_idempotency "
+                "(key, status, request_hash, request_json, archive_id, "
+                "created_at, updated_at) VALUES (?, 'building', ?, ?, NULL, ?, ?)",
+                (key, digest, content, moment, moment),
+            )
+            conn.commit()
+        # Pretend an interrupted temp artifact was left behind as well.
+        leftover = config.archives_dir() / "dead.zip.tmp-cafe"
+        leftover.write_bytes(b"partial")
+
+    # Startup reconciliation releases the orphaned key and removes the artifact.
+    storage.reconcile_archives()
+    assert not leftover.exists()
+    with db.connect() as conn:
+        assert db.get_idempotency(conn, key) is None
+
+    with TestClient(app) as client:
+        # The key is usable again: it now drives a fresh, successful build.
+        created = _idem(client, ids, key, expected=201).json()
+        assert client.get(f"/archives/{created['archive_id']}/content").status_code == 200
+        assert _idem(client, ids, key, expected=200).json()["archive_id"] == (
+            created["archive_id"]
+        )
+
+
+def test_idempotent_key_is_invalidated_by_archive_deletion():
+    with TestClient(app) as client:
+        a = _completed_named(client, "a.txt", b"AAAA")
+        b = _completed_named(client, "b.txt", b"BBBB")
+        ids = [a["session_id"], b["session_id"]]
+        key = "key-deleted"
+
+        first = _idem(client, ids, key, expected=201).json()
+        aid = first["archive_id"]
+        assert storage.archive_path(aid).is_file()
+
+        # Deleting the archive invalidates the key (cascade): replay 404s and
+        # the next keyed request is processed as a brand-new build.
+        assert client.delete(f"/archives/{aid}").status_code == 204
+        assert not storage.archive_path(aid).exists()
+        assert client.get(f"/archives/{aid}/content").status_code == 404
+        with db.connect() as conn:
+            assert db.get_idempotency(conn, key) is None
+
+        second = _idem(client, ids, key, expected=201).json()
+        assert second["archive_id"] != aid
+        assert storage.archive_path(second["archive_id"]).is_file()
+        # Same key now permanently names the new archive.
+        assert _idem(client, ids, key, expected=200).json()["archive_id"] == (
+            second["archive_id"]
+        )
+        # While bound, a different list is still a conflict.
+        assert _idem(client, [b["session_id"]], key).status_code == 409
+
+        # Deleting again frees the key once more: the different list can now be
+        # served as a brand-new request under the recycled key.
+        assert client.delete(f"/archives/{second['archive_id']}").status_code == 204
+        third = _idem(client, [b["session_id"]], key, expected=201)
+        assert third.json()["files"][0]["session_id"] == b["session_id"]
+        assert _idem(client, [b["session_id"]], key, expected=200).status_code == 200
+
+
+def test_idempotent_key_header_validation():
+    with TestClient(app) as client:
+        a = _completed_named(client, "a.txt", b"AAAA")
+        # Blank / whitespace-only keys are 400 (not treated as "no key").
+        for bad_key in ("", "   ", "\t "):
+            resp = _idem(client, [a["session_id"]], bad_key, expected=400)
+            assert "Idempotency-Key" in resp.json()["detail"]
+        # Over-long keys are 400 and never create an archive.
+        rows_before = _archive_rows()
+        resp = _idem(client, [a["session_id"]], "k" * 256, expected=400)
+        assert "Idempotency-Key" in resp.json()["detail"]
+        assert _archive_rows() == rows_before
+        # 255 characters is accepted.
+        ok = _idem(client, [a["session_id"]], "k" * 255, expected=201)
+        assert ok.json()
+
+
+def test_unkeyed_requests_keep_original_stateless_behavior():
+    with TestClient(app) as client:
+        a = _completed_named(client, "a.txt", b"AAAA")
+        b = _completed_named(client, "b.txt", b"BBBB")
+        ids = [a["session_id"], b["session_id"]]
+
+        with db.connect() as conn:
+            keys_before = conn.execute(
+                "SELECT COUNT(*) FROM archive_idempotency"
+            ).fetchone()[0]
+
+        # No Idempotency-Key header -> every request builds a fresh archive.
+        first = _create_archive(client, ids, expected=201).json()
+        second = _create_archive(client, ids, expected=201).json()
+        third = _create_archive(client, list(reversed(ids)), expected=201).json()
+        assert first["archive_id"] != second["archive_id"] != third["archive_id"]
+        assert [f["entry_name"] for f in third["files"]] == ["b.txt", "a.txt"]
+
+        # No idempotency bookkeeping is created by the unkeyed calls.
+        with db.connect() as conn:
+            keys_after = conn.execute(
+                "SELECT COUNT(*) FROM archive_idempotency"
+            ).fetchone()[0]
+        assert keys_after == keys_before
+
+        # Download/delete stay fully usable for the unkeyed archives.
+        for body in (first, second, third):
+            aid = body["archive_id"]
+            assert client.get(f"/archives/{aid}/content").status_code == 200
+            assert client.delete(f"/archives/{aid}").status_code == 204
+            assert client.get(f"/archives/{aid}/content").status_code == 404

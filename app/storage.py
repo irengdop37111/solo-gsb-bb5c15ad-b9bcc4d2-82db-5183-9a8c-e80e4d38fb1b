@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
 import shutil
 import sqlite3
 import threading
+import time
 import uuid
 import zipfile
 from collections.abc import Iterator
@@ -18,6 +20,11 @@ from pathlib import Path
 from . import config, db
 
 _COPY_BUFFER = 1024 * 1024  # 1 MiB streaming buffer for merge/verify/archive IO
+
+# How often a same-key request that lost the builder race re-checks the DB for
+# the builder's outcome. Cross-process waiters poll regardless; in-process
+# waiters are also woken immediately via _idempotency_events.
+_IDEMPOTENCY_POLL_INTERVAL = 0.05
 
 log = logging.getLogger("chunked-upload")
 
@@ -121,7 +128,9 @@ def reconcile_archives() -> None:
 
     Removes published archive files with no DB row, DB rows with no file, their
     entry rows, and any leftover temp artifacts, so a failed process can never
-    leave a downloadable half-built ZIP behind.
+    leave a downloadable half-built ZIP behind. Idempotency keys stranded in
+    'building' by a killed builder are released too: the key must never stay
+    owned by a build that no longer exists.
     """
     files_dir = config.archives_dir()
     with db.connect() as conn:
@@ -136,6 +145,13 @@ def reconcile_archives() -> None:
             conn.execute("DELETE FROM archives WHERE id = ?", (archive_id,))
         for stale in on_disk - ids:
             (files_dir / f"{stale}.zip").unlink(missing_ok=True)
+
+        # Building rows predate this boot, so their builder process is gone by
+        # definition. Rows that happen to point at a now-reconciled archive go
+        # with the archive row (FK cascade); the rest are released outright.
+        conn.execute(
+            "DELETE FROM archive_idempotency WHERE status = 'building'"
+        )
 
     # Temporary artifacts from an interrupted build (none have a DB record).
     if files_dir.is_dir():
@@ -356,12 +372,97 @@ def archive_path(archive_id: str) -> Path:
     return config.archives_dir() / f"{archive_id}.zip"
 
 
-def create_archive(session_ids: list[str]) -> dict:
+class IdempotencyConflict(Exception):
+    """An Idempotency-Key was reused with a different ordered session list.
+
+    HTTP 409: the key permanently represents one request content until the
+    archive it produced is deleted.
+    """
+
+    def __init__(self, key: str):
+        super().__init__("idempotency key was already used with a different request")
+        self.key = key
+
+
+class ArchiveInProgress(Exception):
+    """Another request with the same key still owns the build.
+
+    HTTP 202: the caller waited past its deadline without a terminal result and
+    should retry the identical request.
+    """
+
+    def __init__(self, key: str):
+        super().__init__("an archive with this idempotency key is being built")
+        self.key = key
+
+
+# Per-key in-process signals: the builder sets its Event when it reaches a
+# terminal state, waking same-process waiters immediately; cross-process
+# waiters (and the race where the Event was cleared before a waiter registered)
+# fall back to the short DB poll.
+_idempotency_events: dict[str, threading.Event] = {}
+_idempotency_events_guard = threading.Lock()
+
+
+def _idempotency_event(key: str) -> threading.Event:
+    with _idempotency_events_guard:
+        event = _idempotency_events.get(key)
+        if event is None:
+            event = threading.Event()
+            _idempotency_events[key] = event
+        return event
+
+
+def _discard_idempotency_event(key: str, event: threading.Event) -> None:
+    """Builder-only cleanup: retire the Event it created for this cycle."""
+    with _idempotency_events_guard:
+        if _idempotency_events.get(key) is event:
+            _idempotency_events.pop(key, None)
+
+
+def request_fingerprint(session_ids: list[str]) -> tuple[str, str]:
+    """(hash, canonical json) of the ordered session id list.
+
+    The list is the complete request content of POST /archives, so its order
+    and membership fully define the fingerprint: the same key with a different
+    list (or the same ids in a different order) is a conflict.
+    """
+    content = json.dumps(session_ids, separators=(",", ":"), ensure_ascii=False)
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return digest, content
+
+
+def _record_archive(conn: sqlite3.Connection, archive_id: str, published: Path,
+                    members: list[dict], moment: str) -> None:
+    conn.execute(
+        "INSERT INTO archives (id, path, size, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (archive_id, str(published), published.stat().st_size, moment),
+    )
+    for position, member in enumerate(members):
+        conn.execute(
+            "INSERT INTO archive_entries "
+            "(archive_id, position, session_id, entry_name, file_size) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                archive_id,
+                position,
+                member["session_id"],
+                member["entry_name"],
+                member["file_size"],
+            ),
+        )
+
+
+def _build_archive(session_ids: list[str], idempotency_key: str | None = None) -> dict:
     """Build a ZIP from completed sessions' products, in the given order.
 
     Every source file is opened and validated *first*; only then is the
-    temporary archive written in bounded blocks, published atomically with
-    os.replace(), and finally recorded in the DB. Any failure before publish
+    temporary archive written in bounded blocks and published atomically with
+    os.replace(). For an unkeyed request the DB row is then committed on its
+    own; for a keyed request the archive row and the key's flip to 'completed'
+    are committed in one transaction, so a crash can never leave a key stuck
+    'building' while a downloadable archive exists. Any failure before publish
     removes the temp file, so a broken archive is never downloadable.
     """
     sources: list[sqlite3.Row] = []
@@ -447,24 +548,17 @@ def create_archive(session_ids: list[str]) -> dict:
     moment = db.utcnow()
     with db.connect() as conn:
         try:
-            conn.execute(
-                "INSERT INTO archives (id, path, size, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (archive_id, str(published), published.stat().st_size, moment),
-            )
-            for position, member in enumerate(members):
-                conn.execute(
-                    "INSERT INTO archive_entries "
-                    "(archive_id, position, session_id, entry_name, file_size) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (
-                        archive_id,
-                        position,
-                        member["session_id"],
-                        member["entry_name"],
-                        member["file_size"],
-                    ),
+            _record_archive(conn, archive_id, published, members, moment)
+            if idempotency_key is not None:
+                # Same transaction as the archive row: the key is 'completed'
+                # exactly when the archive becomes downloadable.
+                cur = conn.execute(
+                    "UPDATE archive_idempotency SET status = 'completed', "
+                    "archive_id = ?, updated_at = ? WHERE key = ? AND status = 'building'",
+                    (archive_id, moment, idempotency_key),
                 )
+                if cur.rowcount != 1:
+                    raise RuntimeError("idempotency key is no longer held by this build")
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -473,6 +567,153 @@ def create_archive(session_ids: list[str]) -> dict:
 
     with db.connect() as conn:
         return archive_payload(conn, db.get_archive(conn, archive_id))
+
+
+def create_archive(session_ids: list[str]) -> dict:
+    """Unkeyed archive build: the original, stateless POST /archives behavior."""
+    return _build_archive(session_ids)
+
+
+def _release_building_key(key: str) -> None:
+    """Delete a key still owned by us after a failed/aborted build.
+
+    Guarded on status='building' so a row that somehow reached 'completed' is
+    never torn down. The next identical request becomes a fresh build, so a
+    failure can never permanently occupy the key.
+    """
+    with db.connect() as conn:
+        conn.execute(
+            "DELETE FROM archive_idempotency WHERE key = ? AND status = 'building'",
+            (key,),
+        )
+        conn.commit()
+
+
+def _wait_for_idempotent_result(key: str, request_hash: str,
+                                event: threading.Event,
+                                deadline: float) -> dict | None:
+    """Follow another builder for `key` until it finishes or `deadline` passes.
+
+    Returns the stored archive payload on success, None if the builder released
+    the key (failure) or its record vanished (caller races a fresh claim).
+    Raises IdempotencyConflict on a different request content and
+    ArchiveInProgress if the builder has not finished in time.
+    """
+    while True:
+        with db.connect() as conn:
+            row = db.get_idempotency(conn, key)
+            if row is None:
+                # The builder released its key (failure) or the record was
+                # otherwise lost: caller races to claim a fresh build.
+                return None
+            if row["status"] == "building":
+                if row["request_hash"] != request_hash:
+                    # Can only happen via direct DB meddling; stay honest.
+                    raise IdempotencyConflict(key)
+            else:
+                if row["request_hash"] != request_hash:
+                    raise IdempotencyConflict(key)
+                archive = db.get_archive(conn, row["archive_id"])
+                if archive is not None:
+                    return archive_payload(conn, archive)
+                # Key says completed but the archive is gone (normally the
+                # delete cascades the key away): clear the orphaned row so the
+                # caller's next claim attempt succeeds instead of looping.
+                conn.execute(
+                    "DELETE FROM archive_idempotency WHERE key = ?", (key,)
+                )
+                conn.commit()
+                return None
+
+        if time.monotonic() >= deadline:
+            raise ArchiveInProgress(key)
+        event.wait(_IDEMPOTENCY_POLL_INTERVAL)
+
+
+def create_idempotent_archive(
+    session_ids: list[str],
+    key: str,
+    wait_timeout: float | None = None,
+) -> tuple[dict, bool]:
+    """Build or replay a ZIP archive bound to an Idempotency-Key.
+
+    Returns ``(payload, replayed)``. Semantics:
+
+    * key unseen for this request content -> one builder builds (201).
+    * same key + identical ordered list while building -> wait; the builder's
+      result is replayed (200), or 202 (ArchiveInProgress) past the timeout.
+    * same key + identical list after success -> the same archive is returned,
+      never rebuilt, even if the source sessions were deleted meanwhile.
+    * same key + different list/order -> 409 (IdempotencyConflict).
+    * a failed/interrupted build releases the key; the retry builds anew.
+    """
+    request_hash, request_json = request_fingerprint(session_ids)
+    timeout = (
+        config.IDEMPOTENCY_WAIT_TIMEOUT_SECONDS
+        if wait_timeout is None
+        else wait_timeout
+    )
+    deadline = time.monotonic() + timeout
+
+    while True:
+        event = _idempotency_event(key)
+        is_builder = False
+        orphan_cleared = False
+        with db.connect() as conn:
+            existing = db.get_idempotency(conn, key)
+            if existing is not None:
+                if existing["request_hash"] != request_hash:
+                    raise IdempotencyConflict(key)
+                if existing["status"] == "completed":
+                    archive = db.get_archive(conn, existing["archive_id"])
+                    if archive is not None:
+                        return archive_payload(conn, archive), True
+                    # The archive vanished despite a completed key (normally the
+                    # delete cascades the key away): drop the orphaned row in
+                    # the same txn and fall through to a fresh claim.
+                    conn.execute(
+                        "DELETE FROM archive_idempotency WHERE key = ?", (key,)
+                    )
+                    conn.commit()
+                    orphan_cleared = True
+                # else: another in-process or prior-process builder owns it.
+            else:
+                moment = db.utcnow()
+                try:
+                    conn.execute(
+                        "INSERT INTO archive_idempotency "
+                        "(key, status, request_hash, request_json, archive_id, "
+                        "created_at, updated_at) VALUES (?, 'building', ?, ?, NULL, ?, ?)",
+                        (key, request_hash, request_json, moment, moment),
+                    )
+                    conn.commit()
+                    is_builder = True
+                except sqlite3.IntegrityError:
+                    conn.rollback()
+
+        if is_builder:
+            event = _idempotency_event(key)
+            try:
+                return _build_archive(session_ids, idempotency_key=key), False
+            except BaseException:
+                _release_building_key(key)
+                raise
+            finally:
+                event.set()
+                _discard_idempotency_event(key, event)
+
+        if orphan_cleared:
+            # No live builder to follow; the next loop iteration claims anew.
+            continue
+
+        # Lost the claim race (or the record we saw vanished): wait for the
+        # current builder, then either replay or make one fresh claim attempt.
+        result = _wait_for_idempotent_result(key, request_hash, event, deadline)
+        if result is not None:
+            return result, True
+        # Key was released or invalidated; retry the claim only if time remains.
+        if time.monotonic() >= deadline:
+            raise ArchiveInProgress(key)
 
 
 def archive_payload(conn: sqlite3.Connection, archive: sqlite3.Row) -> dict:

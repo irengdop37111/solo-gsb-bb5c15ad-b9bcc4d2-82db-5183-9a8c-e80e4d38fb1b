@@ -58,6 +58,22 @@ CREATE TABLE IF NOT EXISTS archive_entries (
     file_size       INTEGER NOT NULL,
     PRIMARY KEY (archive_id, position)
 );
+
+-- Idempotency records for POST /archives requests carrying Idempotency-Key.
+-- A row starts in 'building' (owned by exactly one concurrent builder) and is
+-- flipped to 'completed' in the same transaction that inserts its archive;
+-- failed/interrupted builds never leave a live row (builder deletes it, and
+-- the startup reconcile sweeps leftovers). The ON DELETE CASCADE means deleting
+-- the archive invalidates the key: the next request with that key starts over.
+CREATE TABLE IF NOT EXISTS archive_idempotency (
+    key           TEXT PRIMARY KEY,
+    status        TEXT NOT NULL CHECK (status IN ('building', 'completed')),
+    request_hash  TEXT NOT NULL,   -- fingerprint of the ordered session id list
+    request_json  TEXT NOT NULL,   -- the exact request content, persisted
+    archive_id    TEXT REFERENCES archives(id) ON DELETE CASCADE,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
 """
 
 # Columns added when the session-lease feature was introduced; databases
@@ -226,3 +242,12 @@ def get_archive_entries(conn: sqlite3.Connection, archive_id: str) -> list[sqlit
         "FROM archive_entries WHERE archive_id = ? ORDER BY position",
         (archive_id,),
     ).fetchall()
+
+
+# ------------------------------------------------------- archive idempotency
+
+
+def get_idempotency(conn: sqlite3.Connection, key: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM archive_idempotency WHERE key = ?", (key,)
+    ).fetchone()
